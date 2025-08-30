@@ -27,6 +27,9 @@ from sklearn.metrics import (
 
 from tqdm import tqdm
 
+# Import pytorchcv for alternative EfficientNet implementations
+# import pytorchcv.models as models_cv
+
 # Reproducibility
 SEED = 42
 random.seed(SEED)
@@ -69,20 +72,27 @@ def resolve_dataset_path(root_candidates):
     for root in root_candidates:
         if not root:
             continue
-        candidates = [os.path.join(root, 'Data'), root]
+        # Check the root itself and a potential 'Data' subdirectory
+        candidates = [root, os.path.join(root, 'Data')]
         for cand in candidates:
             if os.path.isdir(cand):
                 subdirs = [d for d in os.listdir(cand) if os.path.isdir(os.path.join(cand, d))]
                 found = [d for d in subdirs if d in EXPECTED_CLASSES]
                 if len(found) == len(EXPECTED_CLASSES):
+                    # Ensure all expected classes are found
                     return cand, found
+                # If not all expected classes are found but some are, return the path anyway
+                # This handles cases where the dataset might have slightly different subdirectories
                 if len(found) > 0:
-                    return cand, found
+                     print(f"Found {found} in {cand}, but not all expected classes.")
+                     return cand, found
     return None, []
 
 DATASET_ROOT = os.environ.get('ALZ_DATASET_ROOT', None)
 
+# Prioritize the KaggleHub downloaded path
 common_roots = [
+    path,  # KaggleHub path
     DATASET_ROOT,
     os.path.expanduser(r"~/.cache/kagglehub/datasets/ninadaithal/imagesoasis/versions/1"),
     os.path.expanduser(r"~/kaggle/input/imagesoasis"),
@@ -174,7 +184,7 @@ def make_loaders(dataset_path, class_names, batch_size=BATCH_SIZE, img_size=IMG_
     num_classes = 4
     train_label_tensor = torch.tensor(train_ds.labels, dtype=torch.long)
     class_counts = torch.bincount(train_label_tensor, minlength=num_classes).float()
-    
+
     # More balanced class weights
     class_weights = 1.0 / (class_counts + 1e-8)
     class_weights = class_weights / class_weights.sum() * num_classes
@@ -183,17 +193,17 @@ def make_loaders(dataset_path, class_names, batch_size=BATCH_SIZE, img_size=IMG_
     # Balanced sampling
     per_sample_w = class_weights[train_label_tensor]
     sampler = WeightedRandomSampler(
-        weights=per_sample_w.double(), 
-        num_samples=len(per_sample_w), 
+        weights=per_sample_w.double(),
+        num_samples=len(per_sample_w),
         replacement=True
     )
-    
+
     loaders = {
-        'train': DataLoader(train_ds, batch_size=batch_size, sampler=sampler, shuffle=False, 
+        'train': DataLoader(train_ds, batch_size=batch_size, sampler=sampler, shuffle=False,
                           num_workers=num_workers, pin_memory=True, drop_last=True),
-        'val': DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
+        'val': DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=True),
-        'test': DataLoader(test_ds, batch_size=batch_size, shuffle=False, 
+        'test': DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                          num_workers=num_workers, pin_memory=True),
         'class_weights': class_weights
     }
@@ -315,11 +325,13 @@ def create_model(name: str, num_classes: int = 4, pretrained: bool = True) -> nn
             nn.Linear(512, num_classes)
         )
         return m
+    # Use torchvision for efficientnet models
     if name == 'efficientnet_b6':
         m = models.efficientnet_b6(weights=models.EfficientNet_B6_Weights.IMAGENET1K_V1 if pretrained else None)
+        original_in_features = m.classifier[1].in_features
         m.classifier = nn.Sequential(
             nn.Dropout(0.5),
-            nn.Linear(m.classifier.in_features, 1024),
+            nn.Linear(original_in_features, 1024),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
             nn.Linear(1024, 256),
@@ -329,9 +341,10 @@ def create_model(name: str, num_classes: int = 4, pretrained: bool = True) -> nn
         return m
     if name == 'efficientnet_b7':
         m = models.efficientnet_b7(weights=models.EfficientNet_B7_Weights.IMAGENET1K_V1 if pretrained else None)
+        original_in_features = m.classifier[1].in_features
         m.classifier = nn.Sequential(
             nn.Dropout(0.5),
-            nn.Linear(m.classifier.in_features, 1024),
+            nn.Linear(original_in_features, 1024),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
             nn.Linear(1024, 256),
@@ -354,15 +367,15 @@ ALL_MODELS = [
 def cutmix_data(x, y, alpha=CUTMIX_ALPHA):
     if alpha <= 0:
         return x, y, 1.0
-    
+
     lam = np.random.beta(alpha, alpha)
     batch_size = x.size(0)
     index = torch.randperm(batch_size).to(x.device)
-    
+
     y_a, y_b = y, y[index]
     bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
     x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
-    
+
     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
     return x, (y_a, y_b), lam
 
@@ -400,19 +413,19 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 def train_epoch(model, loader, criterion, optimizer, epoch):
     use_mixup = USE_MIXUP and epoch > HEAD_WARMUP_EPOCHS
     use_cutmix = USE_CUTMIX and epoch > HEAD_WARMUP_EPOCHS
-    
+
     model.train()
     scaler = GradScaler(enabled=torch.cuda.is_available())
     running_loss = 0.0
     correct = 0
     total = 0
     pbar = tqdm(loader, desc=f"Train {epoch+1}")
-    
+
     for images, labels in pbar:
         images = images.to(device)
         labels = labels.to(device)
         optimizer.zero_grad(set_to_none=True)
-        
+
         with autocast('cuda', enabled=torch.cuda.is_available()):
             if use_cutmix and random.random() > 0.5:
                 images, (ya, yb), lam = cutmix_data(images, labels, CUTMIX_ALPHA)
@@ -425,18 +438,18 @@ def train_epoch(model, loader, criterion, optimizer, epoch):
             else:
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-        
+
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
-        
+
         running_loss += loss.item() * images.size(0)
         preds = outputs.argmax(1)
         correct += (preds == labels).sum().item()
         total += images.size(0)
         pbar.set_postfix(loss=running_loss/total, acc=correct/total)
-    
+
     return running_loss/total, correct/total
 
 def eval_epoch(model, loader, criterion, epoch, phase="Val"):
@@ -446,27 +459,27 @@ def eval_epoch(model, loader, criterion, epoch, phase="Val"):
     total = 0
     pbar = tqdm(loader, desc=f"{phase} {epoch+1}")
     all_probs, all_labels, all_preds = [], [], []
-    
+
     with torch.no_grad():
         for images, labels in pbar:
             images = images.to(device)
             labels = labels.to(device)
-            
+
             with autocast('cuda', enabled=torch.cuda.is_available()):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-            
+
             running_loss += loss.item() * images.size(0)
             probs = F.softmax(outputs, dim=1)
             preds = outputs.argmax(1)
             correct += (preds == labels).sum().item()
             total += images.size(0)
-            
+
             all_probs.append(probs.detach().cpu())
             all_labels.append(labels.detach().cpu())
             all_preds.append(preds.detach().cpu())
             pbar.set_postfix(loss=running_loss/total, acc=correct/total)
-    
+
     all_probs = torch.cat(all_probs).numpy()
     all_labels = torch.cat(all_labels).numpy()
     all_preds = torch.cat(all_preds).numpy()
@@ -482,19 +495,21 @@ def train_model(name, loaders, num_epochs=NUM_EPOCHS, lr=LR_BACKBONE, weight_dec
 
     # Progressive unfreezing setup
     head_params, backbone_params = [], []
+    # Need to handle different parameter names for different model types
+    head_layers = ['fc', 'classifier']
     for n, p in model.named_parameters():
-        if any(k in n for k in ['fc', 'classifier']):
+        if any(k in n for k in head_layers):
             head_params.append(p)
         else:
             backbone_params.append(p)
-    
-    # Advanced optimizer with different learning rates
+
+
     optimizer = optim.AdamW([
         {'params': backbone_params, 'lr': lr, 'weight_decay': weight_decay},
         {'params': head_params, 'lr': LR_HEAD, 'weight_decay': weight_decay}
     ])
-    
-    # Cosine annealing scheduler
+
+
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-7
     )
@@ -515,21 +530,21 @@ def train_model(name, loaders, num_epochs=NUM_EPOCHS, lr=LR_BACKBONE, weight_dec
 
         tr_loss, tr_acc = train_epoch(model, loaders['train'], base_criterion, optimizer, epoch)
         va_loss, va_acc, va_probs, va_labels, va_preds = eval_epoch(model, loaders['val'], base_criterion, epoch, phase='Val')
-        
+
         # Test evaluation after each epoch
         te_loss, te_acc, te_probs, te_labels, te_preds = eval_epoch(model, loaders['test'], base_criterion, epoch, phase='Test')
-        
+
         # Calculate test metrics
         te_precision = precision_score(te_labels, te_preds, average='macro', zero_division=0)
         te_recall = recall_score(te_labels, te_preds, average='macro', zero_division=0)
         te_f1 = f1_score(te_labels, te_preds, average='macro', zero_division=0)
-        
+
         try:
             y_true_bin = F.one_hot(torch.tensor(te_labels), num_classes=4).numpy()
             te_auc_macro = roc_auc_score(y_true_bin, te_probs, average='macro', multi_class='ovr')
         except Exception:
             te_auc_macro = 0.0
-        
+
         # Update history with all metrics
         history['train_loss'].append(tr_loss)
         history['train_acc'].append(tr_acc)
@@ -541,14 +556,14 @@ def train_model(name, loaders, num_epochs=NUM_EPOCHS, lr=LR_BACKBONE, weight_dec
         history['test_precision_macro'].append(te_precision)
         history['test_recall_macro'].append(te_recall)
         history['test_auc_macro'].append(te_auc_macro)
-        
+
         scheduler.step()
-        
+
         # Validation metrics
         va_precision = precision_score(va_labels, va_preds, average='macro', zero_division=0)
         va_recall = recall_score(va_labels, va_preds, average='macro', zero_division=0)
         va_f1 = f1_score(va_labels, va_preds, average='macro', zero_division=0)
-        
+
         print(f"Epoch {epoch+1}: train_acc={tr_acc:.4f} val_acc={va_acc:.4f} test_acc={te_acc:.4f} test_f1={te_f1:.4f} test_prec={te_precision:.4f} test_rec={te_recall:.4f} test_auc={te_auc_macro:.4f}")
 
         # per-epoch CSV logging with test results
@@ -595,8 +610,8 @@ def train_model(name, loaders, num_epochs=NUM_EPOCHS, lr=LR_BACKBONE, weight_dec
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    
-    # Final test evaluation with TTA (if enabled)
+
+
     te_loss, te_acc, te_probs, te_labels, te_preds = eval_epoch(model, loaders['test'], base_criterion, -1, phase='Test')
 
     if USE_TTA:
@@ -617,7 +632,7 @@ def train_model(name, loaders, num_epochs=NUM_EPOCHS, lr=LR_BACKBONE, weight_dec
     except Exception:
         auc_macro = 0.0
 
-    # detailed test metrics
+   
     te_precision = precision_score(te_labels, te_preds, average='macro', zero_division=0)
     te_recall = recall_score(te_labels, te_preds, average='macro', zero_division=0)
     te_f1 = f1_score(te_labels, te_preds, average='macro', zero_division=0)
@@ -649,18 +664,18 @@ def train_model(name, loaders, num_epochs=NUM_EPOCHS, lr=LR_BACKBONE, weight_dec
         'state_dict': best_state
     }
 
-# Main training loop
+
 results = []
 os.makedirs('models', exist_ok=True)
 
-# Start with best performing models first
+
 priority_models = [
-    'resnet50', 'resnet101', 'densenet121', 'densenet201',
-    'vgg16', 'vgg19', 'resnet152',
+    'efficientnet_b6', 'efficientnet_b7',
+    'densenet121', 'densenet201',
     'mobilenetv3_large', 'mobilenetv3_small',
     'shufflenet_v2_x1_0',
-    'efficientnet_b6', 'efficientnet_b7'
 ]
+
 
 for name in priority_models:
     try:
