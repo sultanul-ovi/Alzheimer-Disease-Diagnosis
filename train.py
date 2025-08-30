@@ -316,7 +316,7 @@ def create_model(name: str, num_classes: int = 4, pretrained: bool = True) -> nn
         )
         return m
     if name == 'efficientnet_b6':
-        m = models.efficientnet_b6(weights=models.EfficientNet_B6_Weights.IMAGENET1K_V2 if pretrained else None)
+        m = models.efficientnet_b6(weights=models.EfficientNet_B6_Weights.IMAGENET1K_V1 if pretrained else None)
         m.classifier = nn.Sequential(
             nn.Dropout(0.5),
             nn.Linear(m.classifier.in_features, 1024),
@@ -328,7 +328,7 @@ def create_model(name: str, num_classes: int = 4, pretrained: bool = True) -> nn
         )
         return m
     if name == 'efficientnet_b7':
-        m = models.efficientnet_b7(weights=models.EfficientNet_B7_Weights.IMAGENET1K_V2 if pretrained else None)
+        m = models.efficientnet_b7(weights=models.EfficientNet_B7_Weights.IMAGENET1K_V1 if pretrained else None)
         m.classifier = nn.Sequential(
             nn.Dropout(0.5),
             nn.Linear(m.classifier.in_features, 1024),
